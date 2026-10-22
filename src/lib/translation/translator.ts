@@ -5,6 +5,11 @@ interface TranslationItem {
   translated: string;
 }
 
+export interface TranslationOptions {
+  customGeminiKey?: string;
+  customOpenAiKey?: string;
+}
+
 /**
  * Section 3.3: Batch LLM Translation
  * Groups 20 to 30 stitched sentences into a single payload and enforces strict JSON schemas.
@@ -12,13 +17,16 @@ interface TranslationItem {
 export async function batchTranslateSubtitles(
   segments: SubtitleSegment[],
   sourceLang = 'en',
-  targetLang = 'vi'
+  targetLang = 'vi',
+  options?: TranslationOptions
 ): Promise<SubtitleSegment[]> {
   if (!segments || segments.length === 0) return [];
   if (sourceLang.toLowerCase() === targetLang.toLowerCase()) {
-    // If source and target are same, no translation needed
     return segments.map((s) => ({ ...s, translated: s.original }));
   }
+
+  const geminiKey = options?.customGeminiKey || process.env.GEMINI_API_KEY;
+  const openAiKey = options?.customOpenAiKey || process.env.OPENAI_API_KEY;
 
   const BATCH_SIZE = 25;
   const batches: SubtitleSegment[][] = [];
@@ -36,24 +44,24 @@ export async function batchTranslateSubtitles(
     try {
       let batchResults: TranslationItem[] | null = null;
 
-      // Check for Gemini API Key
-      if (process.env.GEMINI_API_KEY) {
-        batchResults = await translateWithGemini(inputBatch, sourceLang, targetLang);
-      } else if (process.env.OPENAI_API_KEY) {
-        batchResults = await translateWithOpenAI(inputBatch, sourceLang, targetLang);
+      // 1. Try Gemini if API key is provided
+      if (geminiKey) {
+        batchResults = await translateWithGemini(inputBatch, sourceLang, targetLang, geminiKey);
+      } else if (openAiKey) {
+        batchResults = await translateWithOpenAI(inputBatch, sourceLang, targetLang, openAiKey);
       }
 
-      // If no LLM keys or LLM failed, use fast fallback
+      // 2. If no API key or LLM failed, use reliable batch translator
       if (!batchResults || batchResults.length === 0) {
-        batchResults = await translateWithFallback(inputBatch, targetLang);
+        batchResults = await translateWithClients5Batch(inputBatch, targetLang);
       }
 
       for (const item of batchResults) {
         translatedSegmentsMap.set(item.id, item.translated);
       }
     } catch (batchErr) {
-      console.warn('Batch translation warning, falling back to line translator:', batchErr);
-      const fallbackResults = await translateWithFallback(inputBatch, targetLang);
+      console.warn('Batch translation warning, attempting resilient fallback:', batchErr);
+      const fallbackResults = await translateWithClients5Batch(inputBatch, targetLang);
       for (const item of fallbackResults) {
         translatedSegmentsMap.set(item.id, item.translated);
       }
@@ -73,11 +81,9 @@ export async function batchTranslateSubtitles(
 async function translateWithGemini(
   items: { id: number; original: string }[],
   sourceLang: string,
-  targetLang: string
+  targetLang: string,
+  apiKey: string
 ): Promise<TranslationItem[]> {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) throw new Error('Missing GEMINI_API_KEY');
-
   const systemInstruction = `You are an accurate, contextual subtitle translator.
 Translate the following array of spoken phrases from ${sourceLang} into ${targetLang}.
 Maintain conversational tone and idiomatic nuances suited for video subtitles.
@@ -126,11 +132,9 @@ Strictly output a valid JSON array preserving the original indices without markd
 async function translateWithOpenAI(
   items: { id: number; original: string }[],
   sourceLang: string,
-  targetLang: string
+  targetLang: string,
+  apiKey: string
 ): Promise<TranslationItem[]> {
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) throw new Error('Missing OPENAI_API_KEY');
-
   const response = await fetch('https://api.openai.com/v1/chat/completions', {
     method: 'POST',
     headers: {
@@ -171,32 +175,85 @@ Strictly output JSON in format: { "items": [ { "id": 1, "translated": "..." } ] 
 }
 
 /**
- * High-reliability fallback translation when no LLM API key is configured
- * Uses Google Translate gtx service endpoint in parallel batches
+ * Ultra-fast batch translation via clients5 Google service
+ * Handles joined newlines without triggering 429 rate limit
  */
-async function translateWithFallback(
+async function translateWithClients5Batch(
   items: { id: number; original: string }[],
   targetLang: string
 ): Promise<TranslationItem[]> {
-  const results = await Promise.all(
+  const texts = items.map((i) => i.original.replace(/\n+/g, ' '));
+  const joinedText = texts.join('\n');
+
+  try {
+    const url = `https://clients5.google.com/translate_a/t?client=dict-chrome-ex&sl=auto&tl=${targetLang}&q=${encodeURIComponent(joinedText)}`;
+    const res = await fetch(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      },
+    });
+
+    if (res.ok) {
+      const data = await res.json();
+      let translatedText = '';
+      if (Array.isArray(data)) {
+        if (Array.isArray(data[0])) {
+          translatedText = data[0][0] || '';
+        } else if (typeof data[0] === 'string') {
+          translatedText = data[0];
+        }
+      }
+
+      const translatedLines = translatedText.split('\n');
+
+      if (translatedLines.length === items.length) {
+        return items.map((item, idx) => ({
+          id: item.id,
+          translated: translatedLines[idx]?.trim() || item.original,
+        }));
+      }
+    }
+  } catch (err) {
+    console.warn('Batch clients5 error, falling back to line-by-line:', err);
+  }
+
+  // Fallback: translate line by line if split counts diverged
+  return Promise.all(
     items.map(async (item) => {
       try {
-        const encoded = encodeURIComponent(item.original);
-        const res = await fetch(
-          `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=${targetLang}&dt=t&q=${encoded}`,
-          { headers: { 'User-Agent': 'Mozilla/5.0' } }
-        );
-        if (!res.ok) throw new Error(`GTX status: ${res.status}`);
-        const data = await res.json();
-        // data[0] is array of [[translatedChunk, originalChunk], ...]
-        const translated = data?.[0]?.map((c: [string]) => c[0]).join('') || item.original;
-        return { id: item.id, translated };
+        const lineUrl = `https://clients5.google.com/translate_a/t?client=dict-chrome-ex&sl=auto&tl=${targetLang}&q=${encodeURIComponent(item.original)}`;
+        const lineRes = await fetch(lineUrl, {
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          },
+        });
+        if (lineRes.ok) {
+          const lineData = await lineRes.json();
+          let lineTrans = '';
+          if (Array.isArray(lineData)) {
+            lineTrans = Array.isArray(lineData[0]) ? lineData[0][0] : lineData[0];
+          }
+          if (lineTrans) {
+            return { id: item.id, translated: lineTrans };
+          }
+        }
+
+        // Secondary fallback to MyMemory API
+        const mmUrl = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(item.original)}&langpair=en|${targetLang}`;
+        const mmRes = await fetch(mmUrl);
+        if (mmRes.ok) {
+          const mmData = await mmRes.json();
+          const mmTrans = mmData.responseData?.translatedText;
+          if (mmTrans) {
+            return { id: item.id, translated: mmTrans };
+          }
+        }
       } catch {
-        return { id: item.id, translated: item.original };
+        // Ignore
       }
+      return { id: item.id, translated: item.original };
     })
   );
-  return results;
 }
 
 function parseJsonArray<T>(text: string): T[] {

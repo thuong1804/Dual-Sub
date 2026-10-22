@@ -13,6 +13,9 @@ export async function POST(req: NextRequest) {
     const targetLanguage = (body.targetLanguage || 'vi').toLowerCase();
     const forceRefresh = Boolean(body.forceRefresh);
 
+    const customGeminiKey = req.headers.get('x-gemini-api-key') || undefined;
+    const customOpenAiKey = req.headers.get('x-openai-api-key') || undefined;
+
     if (!rawVideoId) {
       return NextResponse.json<ProcessSubtitlesResponse>(
         {
@@ -40,15 +43,23 @@ export async function POST(req: NextRequest) {
     if (!forceRefresh) {
       const cached = await getCachedSubtitles(videoId, targetLanguage);
       if (cached && cached.length > 0) {
-        return NextResponse.json<ProcessSubtitlesResponse>({
-          success: true,
-          videoId,
-          sourceLanguage: 'en',
-          targetLanguage,
-          isCached: true,
-          totalSegments: cached.length,
-          subtitles: cached,
-        });
+        // Check if cache actually contains valid translation
+        const isUntranslated =
+          targetLanguage !== 'en' &&
+          cached.length > 0 &&
+          cached.slice(0, Math.min(5, cached.length)).every((s) => s.original === s.translated);
+
+        if (!isUntranslated) {
+          return NextResponse.json<ProcessSubtitlesResponse>({
+            success: true,
+            videoId,
+            sourceLanguage: 'en',
+            targetLanguage,
+            isCached: true,
+            totalSegments: cached.length,
+            subtitles: cached,
+          });
+        }
       }
     } else {
       await invalidateCache(videoId, targetLanguage);
@@ -118,7 +129,11 @@ export async function POST(req: NextRequest) {
     const translatedSubtitles = await batchTranslateSubtitles(
       stitched,
       detectedLang,
-      targetLanguage
+      targetLanguage,
+      {
+        customGeminiKey,
+        customOpenAiKey,
+      }
     );
 
     // Step 5: Save to Two-Tier Cache (Section 3.4)

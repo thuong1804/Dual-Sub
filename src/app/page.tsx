@@ -84,9 +84,15 @@ export default function HomePage() {
       // Step 2: Extracting Captions
       setProcessingStep('extracting');
 
+      const customKey = typeof window !== 'undefined' ? localStorage.getItem('gemini_api_key') || '' : '';
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (customKey) {
+        headers['x-gemini-api-key'] = customKey;
+      }
+
       const response = await fetch('/api/v1/subtitles/process', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify({
           videoId: extractedId,
           targetLanguage: selectedLang,
